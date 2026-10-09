@@ -18,6 +18,8 @@ struct App(SoundApp);
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Proddyt Switch: asks to update from the fork's releases (LABS-156).
+        labs_updater::frame(ctx, "sound-labs", "Sound Labs");
         self.0.logic(ctx);
         // Files dropped on the window: sessions open, audio/MIDI import.
         let dropped: Vec<String> =

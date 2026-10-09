@@ -1870,6 +1870,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "labs-updater"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "serde_json",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3365,6 +3373,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "labs-updater",
  "log",
  "rfd",
  "serde_json",
