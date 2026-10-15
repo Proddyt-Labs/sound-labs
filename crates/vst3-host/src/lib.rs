@@ -25,13 +25,15 @@
 //! component state is accepted too) and re-reads the parameter values.
 //!
 //! Plugin editors (`IPlugView`): on macOS the view is attached to the content `NSView` of a host
-//! `NSWindow` (titled and closable, floating above the app, resized on `IPlugFrame::resizeView`).
+//! `NSWindow` (titled and closable, floating above the app, resized on `IPlugFrame::resizeView`);
+//! on Windows it is attached to a host `HWND` owned by the app's window (no taskbar button,
+//! closing it hides it until the link tears it down).
 //! [`Plugin::open_editor`] opens it directly; [`Plugin::editor`] returns a handle usable on the
 //! main thread while the instance processes on the audio thread (VST3's own threading model:
 //! the controller and its views live on the UI thread). Parameter edits made in the editor
 //! (`IComponentHandler::performEdit`) are reported by the handle's `idle` so the host can write
-//! them into the session. Windows (HWND) and Linux (X11) editor windows are not hosted yet:
-//! opening reports "unsupported".
+//! them into the session. Linux (X11) editor windows are not hosted yet: opening reports
+//! "unsupported".
 //!
 //! Not hosted yet: `IMessage`/`IAttributeList` creation through the host (plugins that need it
 //! for processor ↔ controller messaging may lose those messages), sidechain (aux buses are kept
@@ -114,6 +116,9 @@ pub enum Vst3Error {
 mod api {
     use super::*;
 
+    pub fn cached() -> Option<Vec<Vst3Descriptor>> {
+        registry::cached()
+    }
     pub fn scan() -> Vec<Vst3Descriptor> {
         registry::scan()
     }
@@ -135,12 +140,18 @@ mod api {
     pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
         registry::plugin_info(id)
     }
+    pub fn shutdown() {
+        ffi::exit_modules();
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 mod api {
     use super::*;
 
+    pub fn cached() -> Option<Vec<Vst3Descriptor>> {
+        Some(Vec::new())
+    }
     pub fn scan() -> Vec<Vst3Descriptor> {
         Vec::new()
     }
@@ -162,6 +173,7 @@ mod api {
     pub fn plugin_info(_id: &str) -> Option<&'static PluginInfo> {
         None
     }
+    pub fn shutdown() {}
 }
 
 /// Every plugin in the standard VST3 folders, `VST3_PATH` and folders added with
@@ -185,6 +197,20 @@ pub fn add_search_dir(dir: &Path) -> usize {
 /// Scans the given folders without touching the cache.
 pub fn scan_paths(dirs: &[PathBuf]) -> Vec<Vst3Descriptor> {
     api::scan_paths(dirs)
+}
+
+/// The plugins of the last scan, without scanning: `None` until something has scanned.
+pub fn cached() -> Option<Vec<Vst3Descriptor>> {
+    api::cached()
+}
+
+/// Shuts plugin hosting down: runs the module exit of every loaded binary that has no live
+/// instance left, each on the thread that loaded it; later loads fail. Call it on the main
+/// thread once the plugin instances are gone, before the process exits. Without it the exits
+/// run from an exit handler, by which time some plugins have already torn down state they need
+/// (HALion Sonic crashes in its module exit after it has been used).
+pub fn shutdown() {
+    api::shutdown()
 }
 
 /// The audio module classes in one `.vst3` bundle or file.
@@ -281,11 +307,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    // Unix only: the test points a ".vst3" at a system library through a symlink.
+    #[cfg(unix)]
     #[test]
     fn a_real_library_without_the_vst3_export_is_rejected() {
         // A system library loads fine but has no `GetPluginFactory`.
         // (macOS system libraries live only in the dyld shared cache, not as files.)
-        let lib = if cfg!(target_os = "macos") || cfg!(windows) {
+        let lib = if cfg!(target_os = "macos") {
             None
         } else {
             ["/lib/x86_64-linux-gnu/libz.so.1", "/usr/lib/libz.so.1", "/lib64/libz.so.1"].iter().map(PathBuf::from).find(|p| p.exists())
@@ -295,12 +323,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         // Point a single-file ".vst3" at it via a symlink (no copying of binaries).
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&lib, d.join("z.vst3")).unwrap();
-            let e = load_bundle(&d.join("z.vst3")).unwrap_err();
-            assert!(e.to_string().contains("not a VST3 plugin"), "{e}");
-        }
+        std::os::unix::fs::symlink(&lib, d.join("z.vst3")).unwrap();
+        let e = load_bundle(&d.join("z.vst3")).unwrap_err();
+        assert!(e.to_string().contains("not a VST3 plugin"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

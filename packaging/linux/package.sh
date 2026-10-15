@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Build and package SoundCraft for Linux (<arch> is x86_64 or aarch64):
+# Build and package SoundCraft for Linux (<arch> is x86_64 or aarch64, or riscv64 when cross-compiling):
 #
 #   $DIST/soundcraft-<version>-linux-<arch>.AppImage  any distro with glibc >= the build host's
+#   $DIST/soundcraft-<version>-linux-<arch>.AppImage.zsync  delta updates (needs zsyncmake)
 #   $DIST/soundcraft-<version>-linux-<arch>.deb       Debian, Ubuntu, Mint, Pop!_OS, ...
 #   $DIST/soundcraft-<version>-linux-<arch>.rpm       Fedora, openSUSE, RHEL, ...
 #   $DIST/soundcraft-<version>-linux-<arch>.tar.gz    plain FHS-style tree (bin/, share/)
@@ -10,7 +11,12 @@
 #
 # Needs: cargo; nfpm for deb/rpm (https://nfpm.goreleaser.com); appimagetool for the AppImage
 # (downloaded into $CARGO_TARGET_DIR if missing). Build on an old distro (CI: Ubuntu 22.04,
-# glibc 2.35) so the binaries run on newer ones. Optional: desktop-file-validate, appstreamcli.
+# glibc 2.35) so the binaries run on newer ones. Optional: desktop-file-validate, appstreamcli,
+# zsyncmake (the zsync package) for the AppImage's .zsync.
+#
+# Cross-compiling (CI's linux-riscv64 job, tar.gz only): set CROSS_ARCH (riscv64), CROSS_TARGET
+# (the Rust target), CROSS_COMPILE (the binutils prefix, for strip) and optionally EMULATOR
+# (e.g. qemu-riscv64) to smoke-test the CLI.
 set -euo pipefail
 # shellcheck source=../env.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
@@ -23,15 +29,16 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --skip-build) SKIP_BUILD=1; shift ;;
     --formats) FORMATS="$2"; shift 2 ;;
-    -h | --help) sed -n '2,15p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,19p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-ARCH="$(uname -m)"
+ARCH="${CROSS_ARCH:-$(uname -m)}"
 case "$ARCH" in
   x86_64) DEB_ARCH=amd64 ;;
   aarch64 | arm64) ARCH=aarch64; DEB_ARCH=arm64 ;;
+  riscv64) DEB_ARCH=riscv64 ;;
   *) echo "unsupported architecture $ARCH" >&2; exit 2 ;;
 esac
 export SOUNDCRAFT_MAINTAINER="${SOUNDCRAFT_MAINTAINER:-SoundCraft maintainers <soundcraft@storyteller.ai>}"
@@ -40,9 +47,13 @@ BASENAME="soundcraft-$VERSION-linux-$ARCH"
 echo "==> SoundCraft $VERSION for Linux $ARCH ($FORMATS)"
 
 if [ "$SKIP_BUILD" = 0 ]; then
-  (cd "$ROOT" && cargo build --release --locked -p soundcraft -p soundcraft-cli)
+  if [ -n "${CROSS_TARGET:-}" ]; then
+    (cd "$ROOT" && cargo build --release --locked -p soundcraft -p soundcraft-cli --target "$CROSS_TARGET")
+  else
+    (cd "$ROOT" && cargo build --release --locked -p soundcraft -p soundcraft-cli)
+  fi
 fi
-BIN="$CARGO_TARGET_DIR/release"
+BIN="$CARGO_TARGET_DIR/${CROSS_TARGET:+$CROSS_TARGET/}release"
 WORK="$CARGO_TARGET_DIR/linux-package"
 STAGE="$WORK/root"
 rm -rf "$WORK"
@@ -50,7 +61,7 @@ rm -rf "$WORK"
 # ---- stage an FHS tree (shared by every format) -------------------------------------------------
 install -Dm755 "$BIN/soundcraft" "$STAGE/usr/bin/soundcraft"
 install -Dm755 "$BIN/soundcraft-cli" "$STAGE/usr/bin/soundcraft-cli"
-strip "$STAGE/usr/bin/soundcraft" "$STAGE/usr/bin/soundcraft-cli" 2>/dev/null || true
+"${CROSS_COMPILE:-}strip" "$STAGE/usr/bin/soundcraft" "$STAGE/usr/bin/soundcraft-cli" 2>/dev/null || true
 install -Dm644 "$HERE/$APP_ID.desktop" "$STAGE/usr/share/applications/$APP_ID.desktop"
 install -Dm644 "$HERE/$APP_ID.mime.xml" "$STAGE/usr/share/mime/packages/$APP_ID.xml"
 mkdir -p "$STAGE/usr/share/metainfo"
@@ -108,13 +119,35 @@ if has appimage; then
       chmod +x "$TOOL"
     fi
   fi
-  OUT="$DIST/$BASENAME.AppImage"
+  # Absolute, because appimagetool runs in $DIST below (CARGO_TARGET_DIR or APPIMAGETOOL may be
+  # relative).
+  OUT="$(cd "$DIST" && pwd)/$BASENAME.AppImage"
+  APPDIR="$(cd "$APPDIR" && pwd)"
+  TOOL="$(cd "$(dirname "$TOOL")" && pwd)/$(basename "$TOOL")"
+  # A .zsync left by an earlier run would hide a missing zsyncmake and describe another file.
+  rm -f "$OUT.zsync"
+  # Update information: AppImageUpdate, AppImageLauncher and the like read it from the file and
+  # fetch only the blocks that changed in a newer release, through the .zsync published next to
+  # each AppImage on GitHub Releases. `latest` is the newest published release that is not a
+  # pre-release. A fork's builds point at its own releases through GITHUB_REPOSITORY.
+  REPO="${GITHUB_REPOSITORY:-storytold/soundcraft}"
+  UPDATE_INFO="gh-releases-zsync|${REPO%%/*}|${REPO#*/}|latest|soundcraft-*-linux-$ARCH.AppImage.zsync"
   # Extract-and-run: works without FUSE (containers, CI). The output embeds the static runtime,
-  # so users don't need libfuse2 either.
-  ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" --no-appstream "$APPDIR" "$OUT"
+  # so users don't need libfuse2 either. With zsyncmake on the host (CI installs the zsync
+  # package) appimagetool also writes the .zsync, into its working directory, hence the cd.
+  (cd "$DIST" && ARCH="$ARCH" APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" --no-appstream -u "$UPDATE_INFO" "$APPDIR" "$OUT")
   echo "wrote $OUT"
+  if [ -s "$OUT.zsync" ]; then
+    echo "wrote $OUT.zsync"
+  else
+    warn "zsyncmake not found, so $OUT.zsync was not written; AppImage delta updates need it"
+  fi
 fi
 
-"$STAGE/usr/bin/soundcraft-cli" --version
+if [ -z "${CROSS_TARGET:-}" ]; then
+  "$STAGE/usr/bin/soundcraft-cli" --version
+elif [ -n "${EMULATOR:-}" ]; then
+  "$EMULATOR" "$STAGE/usr/bin/soundcraft-cli" --version
+fi
 echo "==> done"
 ls -lh "$DIST"

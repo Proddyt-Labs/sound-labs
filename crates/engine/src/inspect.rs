@@ -3,11 +3,11 @@
 use crate::Engine;
 use serde_json::{Value, json};
 use soundcraft_model::{Clip, ClipContent, ClipId, Track, TrackId};
-use soundcraft_time::{TimeFormat, format_position};
+use soundcraft_time::TimeFormat;
 
 fn clip_json(e: &Engine, c: &Clip) -> Value {
     let s = e.session();
-    let fmt = |x| format_position(x, TimeFormat::MinSecs, s.sample_rate, &s.tempo, s.frame_rate, s.timecode_start);
+    let fmt = |x| s.format_position(x, TimeFormat::MinSecs);
     let mut v = json!({
         "id": c.id, "name": c.name, "start": c.start, "end": c.end(), "length": c.length,
         "start_time": fmt(c.start), "gain_db": c.gain_db, "muted": c.muted,
@@ -80,9 +80,13 @@ pub fn session(e: &Engine, full: bool) -> Value {
         "busses": s.busses.iter().map(|b| json!({"id": b.id, "name": b.name, "format": b.format.label()})).collect::<Vec<_>>(),
         "markers": s.markers.iter().map(|m| json!({"id": m.id, "number": m.number, "name": m.name, "kind": m.kind, "start": m.start, "end": m.end})).collect::<Vec<_>>(),
         "groups": s.groups.iter().map(|g| json!({"id": g.id, "name": g.name, "letter": g.letter, "members": g.members, "active": g.active})).collect::<Vec<_>>(),
-        "sources": s.sources.iter().map(|x| json!({"id": x.id, "name": x.name, "channels": x.channels, "frames": x.frames, "path": x.path})).collect::<Vec<_>>(),
+        "sources": s.sources.iter().map(|x| json!({
+            "id": x.id, "name": x.name, "channels": x.channels, "frames": x.frames, "path": x.path,
+            "loaded": s.pool.contains(x.id),
+        })).collect::<Vec<_>>(),
         "selection": {"start": s.edit.selection.start, "end": s.edit.selection.end, "tracks": s.edit.selected_tracks, "clips": s.edit.selected_clips},
         "edit_mode": s.edit.edit_mode, "tool": s.edit.tool, "grid": s.edit.grid.label(), "nudge": s.edit.nudge.label(),
+        "zoom": {"samples_per_px": s.edit.zoom.samples_per_px, "scroll": s.edit.zoom.scroll},
         "transport": e.transport,
         "undo": e.undo_label(), "redo": e.redo_label(),
     })
@@ -106,7 +110,7 @@ pub fn clip(e: &Engine, id: ClipId) -> Option<Value> {
 /// Plain-text session report (File › Export › Session Info as Text).
 pub fn session_text(e: &Engine) -> String {
     let s = e.session();
-    let fmt = |x| format_position(x, TimeFormat::MinSecs, s.sample_rate, &s.tempo, s.frame_rate, s.timecode_start);
+    let fmt = |x| s.format_position(x, TimeFormat::MinSecs);
     let mut out = String::new();
     out.push_str(&format!("SESSION NAME:\t{}\nSAMPLE RATE:\t{}\nBIT DEPTH:\t{:?}\nTIMECODE FORMAT:\t{}\n# OF AUDIO TRACKS:\t{}\n# OF AUDIO CLIPS:\t{}\n# OF AUDIO FILES:\t{}\n\n",
         s.name, s.sample_rate.hz(), s.bit_depth, s.frame_rate.label(),
@@ -145,4 +149,26 @@ pub fn session_text(e: &Engine) -> String {
         out.push_str(&format!("{}\t{}\t{}\n", m.number, fmt(m.start), m.name));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sources_report_whether_audio_is_loaded() {
+        let mut e = crate::demo::demo_engine();
+        let before = session(&e, false);
+        let sources = before["sources"].as_array().expect("sources");
+        assert!(!sources.is_empty());
+        assert!(sources.iter().all(|s| s["loaded"] == true), "{sources:?}");
+
+        let id = e.session().sources[0].id;
+        assert!(e.session_mut().pool.remove(id).is_some());
+        let after = session(&e, false);
+        let entry = after["sources"].as_array().unwrap().iter().find(|s| s["id"] == json!(id)).expect("source still listed");
+        assert_eq!(entry["loaded"], false, "{entry}");
+        assert_eq!(entry["path"], before["sources"][0]["path"], "metadata stays even when unloaded");
+    }
 }
